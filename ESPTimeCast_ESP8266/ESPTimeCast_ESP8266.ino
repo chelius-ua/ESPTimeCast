@@ -3735,10 +3735,18 @@ void loop() {
     static unsigned long haSensorStartTime = 0;
     static bool haSensorInitialized = false;
     static unsigned long modeStartTime = 0;
+    static int lastDisplayMode = -1;
     
-    // Initialize mode start time
-    if (prevDisplayMode != displayMode) {
+    // Initialize mode when entering from another mode
+    if (lastDisplayMode != displayMode) {
       modeStartTime = millis();
+      currentHaSensorIndex = 0;  // Start from first sensor
+      haSensorInitialized = false;
+      P.displayClear();  // Clear any previous content
+      P.displayReset();
+      Serial.println(F("[HA DISPLAY] Entering HA display mode, cleared screen"));
+      yield();
+      lastDisplayMode = displayMode;
     }
     
     // Safety timeout: if stuck in HA mode for more than 30 seconds, force advance
@@ -3746,6 +3754,10 @@ void loop() {
       Serial.println(F("[HA DISPLAY] Safety timeout reached, forcing mode advance"));
       currentHaSensorIndex = 0;
       haSensorInitialized = false;
+      lastDisplayMode = -1;
+      prevDisplayMode = -1;
+      P.displayClear();
+      yield();
       advanceDisplayModeSafe();
       return;
     }
@@ -3761,17 +3773,27 @@ void loop() {
       // Skip invalid sensor, advance to next
       Serial.printf("[HA DISPLAY] Skipping invalid sensor %d\n", currentHaSensorIndex);
       currentHaSensorIndex++;
+      haSensorInitialized = false;
+      prevDisplayMode = -1;  // Force re-initialization
+      
       if (currentHaSensorIndex >= haSensorCount) {
         currentHaSensorIndex = 0;
+        lastDisplayMode = -1;
         Serial.println(F("[HA DISPLAY] No valid sensors, advancing mode"));
+        P.displayClear();
+        yield();
         advanceDisplayModeSafe();
-        haSensorInitialized = false;
       }
       return;  // Exit this cycle, try next sensor in next loop
     }
     
     // Initialize display for this sensor only once
     if (prevDisplayMode != displayMode || !haSensorInitialized) {
+      // CRITICAL: Clear display before showing new sensor
+      P.displayClear();
+      P.displayReset();
+      yield();
+      
       // Build display string: "LABEL: VALUE UNIT"
       String displayText = "";
       if (strlen(currentSensor->label) > 0) {
@@ -3788,6 +3810,16 @@ void loop() {
       // Sanitize text for LED display - remove unsupported characters
       displayText = sanitizeForDisplay(displayText);
       
+      // Validate that we have something to display
+      if (displayText.length() == 0) {
+        displayText = "NO DATA";
+      }
+      
+      // Trim to reasonable length (MAX72xx has buffer limits)
+      if (displayText.length() > 100) {
+        displayText = displayText.substring(0, 100);
+      }
+      
       Serial.printf("[HA DISPLAY] Sanitized text: '%s' (len=%d)\n", displayText.c_str(), displayText.length());
       
       // Check if we need to scroll or display static
@@ -3795,14 +3827,19 @@ void loop() {
       
       haSensorStartTime = millis();
       
+      // Make a local copy to ensure it stays valid
+      static char displayBuffer[128];
+      strncpy(displayBuffer, displayText.c_str(), sizeof(displayBuffer) - 1);
+      displayBuffer[sizeof(displayBuffer) - 1] = '\0';  // Ensure null termination
+      
       if (needsScroll) {
-        P.displayText(displayText.c_str(), PA_CENTER, GENERAL_SCROLL_SPEED, 0, 
+        P.displayText(displayBuffer, PA_CENTER, GENERAL_SCROLL_SPEED, 0, 
                      getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay), 
                      getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay));
-        Serial.printf("[HA DISPLAY] Scrolling sensor %d: %s\n", currentHaSensorIndex, displayText.c_str());
+        Serial.printf("[HA DISPLAY] Scrolling sensor %d: %s\n", currentHaSensorIndex, displayBuffer);
       } else {
-        P.displayText(displayText.c_str(), PA_CENTER, 0, haDuration, PA_PRINT, PA_NO_EFFECT);
-        Serial.printf("[HA DISPLAY] Static sensor %d: %s\n", currentHaSensorIndex, displayText.c_str());
+        P.displayText(displayBuffer, PA_CENTER, 0, haDuration, PA_PRINT, PA_NO_EFFECT);
+        Serial.printf("[HA DISPLAY] Static sensor %d: %s\n", currentHaSensorIndex, displayBuffer);
       }
       
       prevDisplayMode = displayMode;
@@ -3814,12 +3851,19 @@ void loop() {
       // Animation cycle complete, move to next sensor
       Serial.printf("[HA DISPLAY] Sensor %d display complete (count=%d/%d)\n", 
                     currentHaSensorIndex, currentHaSensorIndex + 1, haSensorCount);
+      
+      // Small delay between sensors to ensure clean transition
+      delay(100);
+      
       currentHaSensorIndex++;
       haSensorInitialized = false;  // Need to initialize next sensor
       
       if (currentHaSensorIndex >= haSensorCount) {
         currentHaSensorIndex = 0;
+        lastDisplayMode = -1;  // Reset for next time we enter this mode
         Serial.println(F("[HA DISPLAY] All sensors shown, advancing mode"));
+        P.displayClear();  // Clear before moving to next mode
+        yield();
         prevDisplayMode = -1;
         advanceDisplayModeSafe();
       } else {
