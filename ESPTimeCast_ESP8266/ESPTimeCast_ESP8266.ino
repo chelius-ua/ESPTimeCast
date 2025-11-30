@@ -120,6 +120,12 @@ const unsigned long haFetchInterval = 60000;  // 1 minute
 int currentHaSensorIndex = 0;
 bool haDataAvailable = false;
 
+// For async test from WebUI
+bool haTestRequested = false;
+String haTestIp = "";
+int haTestPort = 8123;
+String haTestToken = "";
+
 // Runtime Uptime Tracker
 unsigned long bootMillis = 0;                      // Stores millis() at boot
 unsigned long lastUptimeLog = 0;                   // Timer for hourly logging
@@ -1197,60 +1203,16 @@ void setupWebServer() {
     // Trim token to remove any whitespace
     testToken.trim();
     
-    // Test connection to Home Assistant API
-    String url = "http://" + testIp + ":" + String(testPort) + "/api/";
+    // Store test parameters for async execution in loop()
+    haTestIp = testIp;
+    haTestPort = testPort;
+    haTestToken = testToken;
+    haTestRequested = true;
     
-    Serial.printf("[TEST_HA] Testing connection to: %s\n", url.c_str());
-    Serial.printf("[TEST_HA] Token length: %d\n", testToken.length());
-    Serial.printf("[TEST_HA] Token preview: %.20s...\n", testToken.c_str());
+    Serial.println(F("[TEST_HA] Test scheduled, check Serial Monitor for results"));
     
-    // Print first 20 bytes in hex
-    Serial.print("[TEST_HA] Token hex (first 20 bytes): ");
-    for (int i = 0; i < 20 && i < testToken.length(); i++) {
-      Serial.printf("%02X ", (unsigned char)testToken[i]);
-    }
-    Serial.println();
-    
-    WiFiClient testClient;
-    HTTPClient http;
-    http.begin(testClient, url);
-    http.setTimeout(3000);  // Shorter timeout to prevent watchdog
-    
-    String authHeader = "Bearer " + testToken;
-    http.addHeader("Authorization", authHeader);
-    http.addHeader("Content-Type", "application/json");
-    
-    Serial.printf("[TEST_HA] Authorization header length: %d\n", authHeader.length());
-    
-    yield();  // Give ESP8266 time to process
-    ESP.wdtFeed();  // Feed the watchdog
-    
-    int httpCode = http.GET();
-    
-    yield();  // Give ESP8266 time to process
-    
-    DynamicJsonDocument responseDoc(128);  // Smaller buffer
-    
-    String response;
-    
-    if (httpCode == HTTP_CODE_OK) {
-      Serial.println(F("[TEST_HA] Connection successful!"));
-      response = "{\"success\":true,\"message\":\"Successfully connected to Home Assistant!\"}";
-    } else if (httpCode == 401) {
-      Serial.println(F("[TEST_HA] Authentication failed (401)"));
-      response = "{\"success\":false,\"message\":\"Authentication failed. Check your token.\"}";
-    } else if (httpCode == -1 || httpCode == -11) {
-      Serial.println(F("[TEST_HA] Connection failed (timeout or unreachable)"));
-      response = "{\"success\":false,\"message\":\"Connection timeout. Check IP and network.\"}";
-    } else {
-      Serial.printf("[TEST_HA] HTTP error: %d\n", httpCode);
-      response = "{\"success\":false,\"message\":\"HTTP error: " + String(httpCode) + "\"}";
-    }
-    
-    http.end();
-    yield();
-    
-    request->send(200, "application/json", response);
+    // Return immediately without blocking
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Test started. Check Serial Monitor for results in a few seconds.\"}");
   });
 
   server.on("/set_twelvehour", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -3161,6 +3123,60 @@ void loop() {
   } else {
     weatherFetchInitiated = false;
     shouldFetchWeatherNow = false;
+  }
+
+  // --- Home Assistant Test (async from WebUI) ---
+  if (haTestRequested && !isAPMode && WiFi.status() == WL_CONNECTED) {
+    haTestRequested = false;  // Reset flag immediately
+    
+    Serial.println(F("[TEST_HA] Executing test connection..."));
+    String url = "http://" + haTestIp + ":" + String(haTestPort) + "/api/";
+    
+    Serial.print(F("[TEST_HA] Testing: "));
+    Serial.println(url);
+    Serial.print(F("[TEST_HA] Token length: "));
+    Serial.println(haTestToken.length());
+    
+    yield();
+    
+    WiFiClient testClient;
+    HTTPClient http;
+    
+    if (http.begin(testClient, url)) {
+      http.setTimeout(2000);  // 2 second timeout
+      
+      String authHeader = "Bearer " + haTestToken;
+      http.addHeader("Authorization", authHeader);
+      http.addHeader("Content-Type", "application/json");
+      
+      yield();
+      
+      int httpCode = http.GET();
+      
+      yield();
+      
+      if (httpCode == HTTP_CODE_OK || httpCode == 200) {
+        Serial.println(F("[TEST_HA] ✓ Connection successful!"));
+      } else if (httpCode == 401) {
+        Serial.println(F("[TEST_HA] ✗ Authentication failed (401) - check token"));
+      } else if (httpCode < 0) {
+        Serial.print(F("[TEST_HA] ✗ Connection failed: "));
+        Serial.println(httpCode);
+      } else {
+        Serial.print(F("[TEST_HA] ✗ HTTP error: "));
+        Serial.println(httpCode);
+      }
+      
+      http.end();
+    } else {
+      Serial.println(F("[TEST_HA] ✗ Failed to initialize connection"));
+    }
+    
+    yield();
+    
+    // Clear test data
+    haTestIp = "";
+    haTestToken = "";
   }
 
   // --- Home Assistant Data Fetching ---
