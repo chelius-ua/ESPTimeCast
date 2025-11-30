@@ -669,6 +669,67 @@ textarea::placeholder {
       </div>
     </div>   
   </div>
+
+  <!-- Home Assistant Integration Section -->
+  <button type="button" class="collapsible-toggle" aria-expanded="false">
+    <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 2l9 4.5v9L12 22l-9-6.5v-9L12 2z"></path>
+      <path d="M12 22V12"></path>
+      <path d="M12 12L3 6.5"></path>
+      <path d="M12 12l9-5.5"></path>
+    </svg>
+    <span>Home Assistant Integration</span>
+  </button>
+
+  <div class="collapsible-content" aria-hidden="true">
+    <div class="form-group">
+      <label style="display: flex; align-items: center; justify-content: space-between;">
+        <span style="margin-right: 0.5em;">Enable Home Assistant:</span>
+        <span class="toggle-switch">
+          <input type="checkbox" id="haEnabled" name="haEnabled">
+          <span class="toggle-slider"></span>
+        </span>
+      </label>
+    </div>
+
+    <div class="form-group">
+      <label for="haIp">Home Assistant IP Address:</label>
+      <input type="text" id="haIp" name="haIp" class="form-control" 
+        placeholder="192.168.1.100">
+    </div>
+
+    <div class="form-group">
+      <label for="haPort">Port:</label>
+      <input type="number" id="haPort" name="haPort" class="form-control" 
+        value="8123" min="1" max="65535">
+    </div>
+
+    <div class="form-group">
+      <label for="haToken">Long-Lived Access Token:</label>
+      <input type="password" id="haToken" name="haToken" class="form-control" 
+        placeholder="Enter your Home Assistant token">
+      <div class="small">Get token from: Profile → Security → Long-Lived Access Tokens</div>
+    </div>
+
+    <div class="form-group">
+      <label for="haDuration">Display Duration (ms):</label>
+      <input type="number" id="haDuration" name="haDuration" class="form-control" 
+        value="5000" min="1000" max="60000" step="1000">
+    </div>
+
+    <button type="button" class="primary-button" id="testHaBtn" style="width: auto; margin-bottom: 1rem;">
+      Test Connection
+    </button>
+
+    <div class="form-group">
+      <label style="font-weight: bold;">Sensors (max 10):</label>
+      <div id="haSensorsContainer"></div>
+      <button type="button" class="primary-button" id="addHaSensorBtn" style="width: auto; margin-top: 0.5rem;">
+        + Add Sensor
+      </button>
+    </div>
+  </div>
+
   <input type="submit" class="primary-button" value="Save Settings">
 </form>
 
@@ -862,6 +923,45 @@ window.onload = function () {
     });
     setCountdownFieldsEnabled(countdownEnabledEl.checked);
 
+    // --- Home Assistant Integration Loading ---
+    if (data.homeAssistant) {
+      const ha = data.homeAssistant;
+      document.getElementById('haEnabled').checked = ha.enabled || false;
+      document.getElementById('haIp').value = ha.ip || '';
+      document.getElementById('haPort').value = ha.port || 8123;
+      document.getElementById('haToken').value = ha.token || '';
+      document.getElementById('haDuration').value = ha.duration || 5000;
+      
+      // Load sensors
+      if (ha.sensors && Array.isArray(ha.sensors)) {
+        ha.sensors.forEach((sensor, index) => {
+          addHaSensorRow(sensor.entityId, sensor.label);
+        });
+      }
+    }
+    
+    // Add first sensor row if none exist
+    if (document.querySelectorAll('.ha-sensor-row').length === 0) {
+      addHaSensorRow('', '');
+    }
+    
+    // HA Event Listeners
+    document.getElementById('haEnabled').addEventListener('change', function() {
+      setHaFieldsEnabled(this.checked);
+    });
+    setHaFieldsEnabled(document.getElementById('haEnabled').checked);
+    
+    document.getElementById('addHaSensorBtn').addEventListener('click', function() {
+      if (document.querySelectorAll('.ha-sensor-row').length < 10) {
+        addHaSensorRow('', '');
+      } else {
+        alert('Maximum 5 sensors allowed');
+      }
+    });
+    
+    document.getElementById('testHaBtn').addEventListener('click', testHaConnection);
+    // --- End Home Assistant Integration Loading ---
+
     if (data.customMessage !== undefined) {
       document.getElementById('customMessage').value = data.customMessage;
     }
@@ -974,6 +1074,34 @@ async function submitConfig(event) {
   const finalCountdownLabel = document.getElementById('countdownLabel').value.toUpperCase().replace(/[^A-Z0-9 :!'\-.,_\+%\/?]/g, '');
   formData.set('countdownLabel', finalCountdownLabel);
   // --- END NEW ---
+
+  // --- Home Assistant Form Data ---
+  formData.set('haEnabled', document.getElementById('haEnabled').checked ? 'true' : 'false');
+  formData.set('haIp', document.getElementById('haIp').value);
+  formData.set('haPort', document.getElementById('haPort').value);
+  
+  // Handle HA token masking like API key
+  const haTokenInput = document.getElementById('haToken');
+  if (haTokenInput.value !== '********************************' && haTokenInput.value.length > 0) {
+    formData.set('haToken', haTokenInput.value);
+  } else {
+    // If masked, still send the mask so backend knows to keep existing token
+    formData.set('haToken', haTokenInput.value);
+  }
+  
+  formData.set('haDuration', document.getElementById('haDuration').value);
+  
+  // Collect all sensor data
+  const sensorRows = document.querySelectorAll('.ha-sensor-row');
+  sensorRows.forEach((row, index) => {
+    const entityId = row.querySelector('.ha-entity-id').value;
+    const label = row.querySelector('.ha-label').value.toUpperCase();
+    if (entityId) {  // Only include if entity ID is provided
+      formData.set('haEntityId' + index, entityId);
+      formData.set('haLabel' + index, label);
+    }
+  });
+  // --- END Home Assistant Form Data ---
 
   const params = new URLSearchParams();
   for (const pair of formData.entries()) {
@@ -1206,29 +1334,30 @@ function hideSavingModal() {
   }
 }
 
-const toggle = document.querySelector('.collapsible-toggle');
-const content = document.querySelector('.collapsible-content');
-toggle.addEventListener('click', function() {
-  const isOpen = toggle.classList.toggle('open');
-  toggle.setAttribute('aria-expanded', isOpen);
-  content.setAttribute('aria-hidden', !isOpen);
-  if(isOpen) {
-    content.style.height = content.scrollHeight + 'px';
-    content.addEventListener('transitionend', function handler() {
-      content.style.height = 'auto';
-      content.removeEventListener('transitionend', handler);
+// Handle all collapsible sections
+const toggles = document.querySelectorAll('.collapsible-toggle');
+toggles.forEach((toggle, index) => {
+  const content = toggle.nextElementSibling;
+  if (content && content.classList.contains('collapsible-content')) {
+    toggle.addEventListener('click', function() {
+      const isOpen = toggle.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', isOpen);
+      content.setAttribute('aria-hidden', !isOpen);
+      if(isOpen) {
+        content.style.height = content.scrollHeight + 'px';
+        content.addEventListener('transitionend', function handler() {
+          content.style.height = 'auto';
+          content.removeEventListener('transitionend', handler);
+        });
+      } else {
+        content.style.height = content.scrollHeight + 'px';
+        // Force reflow to make sure the browser notices the height before transitioning to 0
+        void content.offsetHeight;
+        content.style.height = '0px';
+      }
     });
-  } else {
-    content.style.height = content.scrollHeight + 'px';
-    // Force reflow to make sure the browser notices the height before transitioning to 0
-    void content.offsetHeight;
-    content.style.height = '0px';
   }
 });
-// Optional: If open on load, set height to auto
-if(toggle.classList.contains('open')) {
-  content.style.height = 'auto';
-}
 
 let brightnessDebounceTimeout = null;
 
@@ -1351,6 +1480,108 @@ function setIsDramaticCountdown(val) {
   });
 }
 // --- END Countdown Controls Logic ---
+
+
+// --- Home Assistant Controls Logic ---
+let haSensorCounter = 0;
+
+function addHaSensorRow(entityId = '', label = '') {
+  const container = document.getElementById('haSensorsContainer');
+  const rowId = 'haSensorRow' + haSensorCounter++;
+  
+  const row = document.createElement('div');
+  row.className = 'ha-sensor-row';
+  row.id = rowId;
+  row.style.cssText = 'display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: flex-start;';
+  
+  row.innerHTML = `
+    <div style="flex: 1;">
+      <input type="text" name="haEntityId${container.children.length}" 
+        class="form-control ha-entity-id" placeholder="sensor.temperature"
+        value="${entityId}" style="margin-bottom: 0.25rem;">
+    </div>
+    <div style="flex: 1;">
+      <input type="text" name="haLabel${container.children.length}" 
+        class="form-control ha-label" placeholder="TEMP" maxlength="15"
+        value="${label}">
+    </div>
+    <button type="button" onclick="removeHaSensorRow('${rowId}')" 
+      style="background: #dc3545; border: none; color: white; padding: 0.5rem 0.75rem; 
+      border-radius: 4px; cursor: pointer; flex-shrink: 0;">×</button>
+  `;
+  
+  container.appendChild(row);
+  renumberHaSensors();
+}
+
+function removeHaSensorRow(rowId) {
+  const row = document.getElementById(rowId);
+  if (row) {
+    row.remove();
+    renumberHaSensors();
+  }
+}
+
+function renumberHaSensors() {
+  const container = document.getElementById('haSensorsContainer');
+  const rows = container.querySelectorAll('.ha-sensor-row');
+  rows.forEach((row, index) => {
+    const entityInput = row.querySelector('.ha-entity-id');
+    const labelInput = row.querySelector('.ha-label');
+    if (entityInput) entityInput.name = 'haEntityId' + index;
+    if (labelInput) labelInput.name = 'haLabel' + index;
+  });
+}
+
+function setHaFieldsEnabled(enabled) {
+  document.getElementById('haIp').disabled = !enabled;
+  document.getElementById('haPort').disabled = !enabled;
+  document.getElementById('haToken').disabled = !enabled;
+  document.getElementById('haDuration').disabled = !enabled;
+  document.getElementById('testHaBtn').disabled = !enabled;
+  document.getElementById('addHaSensorBtn').disabled = !enabled;
+  
+  const sensorInputs = document.querySelectorAll('.ha-entity-id, .ha-label');
+  sensorInputs.forEach(input => input.disabled = !enabled);
+}
+
+async function testHaConnection() {
+  const ip = document.getElementById('haIp').value;
+  const port = document.getElementById('haPort').value;
+  const token = document.getElementById('haToken').value;
+  
+  if (!ip || !token) {
+    alert('Please enter IP address and token');
+    return;
+  }
+  
+  const testBtn = document.getElementById('testHaBtn');
+  const originalText = testBtn.textContent;
+  testBtn.textContent = 'Testing...';
+  testBtn.disabled = true;
+  
+  try {
+    const params = new URLSearchParams();
+    params.append('ip', ip);
+    params.append('port', port);
+    params.append('token', token);
+    
+    const response = await fetch('/test_ha', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    
+    const result = await response.json();
+    alert(result.message);
+  } catch (error) {
+    alert('Test failed: ' + error.message);
+  } finally {
+    testBtn.textContent = originalText;
+    testBtn.disabled = false;
+  }
+}
+// --- END Home Assistant Controls Logic ---
 
 
 // --- Dimming Controls Logic ---

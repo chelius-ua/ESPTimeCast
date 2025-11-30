@@ -99,6 +99,27 @@ time_t countdownTargetTimestamp = 0;  // Unix timestamp
 char countdownLabel[64] = "";         // Label for the countdown
 bool isDramaticCountdown = true;      // Default to the dramatic countdown mode
 
+// --- Home Assistant Integration ---
+struct HaSensor {
+  char entityId[48];    // Reduced from 64 to save memory
+  char label[20];       // Reduced from 32 to save memory
+  char value[32];       // Reduced from 64 to save memory
+  char unit[12];        // Reduced from 16 to save memory
+  bool isValid;
+};
+
+bool haEnabled = false;  // Set via Web UI to enable
+char haIp[48] = "";
+int haPort = 8123;
+char haToken[192] = "";
+unsigned long haDuration = 5000;
+HaSensor haSensors[5];   // Max 5 sensors to save memory
+int haSensorCount = 0;
+unsigned long lastHaFetchTime = 0;
+const unsigned long haFetchInterval = 60000;  // 1 minute
+int currentHaSensorIndex = 0;
+bool haDataAvailable = false;
+
 // Runtime Uptime Tracker
 unsigned long bootMillis = 0;                      // Stores millis() at boot
 unsigned long lastUptimeLog = 0;                   // Timer for hourly logging
@@ -123,7 +144,7 @@ bool shouldFetchWeatherNow = false;
 
 unsigned long lastSwitch = 0;
 unsigned long lastColonBlink = 0;
-int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown
+int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown, 4: HA Sensors, 5: Date, 6: Custom Message, 7: Nightscout
 int prevDisplayMode = -1;
 bool clockScrollDone = false;
 int currentHumidity = -1;
@@ -259,6 +280,15 @@ void loadConfig() {
     countdownObj["label"] = "";
     countdownObj["isDramaticCountdown"] = true;
 
+    // Add Home Assistant defaults when creating a new config.json
+    JsonObject haObj = doc.createNestedObject("homeAssistant");
+    haObj["enabled"] = false;
+    haObj["ip"] = "";
+    haObj["port"] = 8123;
+    haObj["token"] = "";
+    haObj["duration"] = 5000;
+    JsonArray sensorsArray = haObj.createNestedArray("sensors");
+
     File f = LittleFS.open("/config.json", "w");
     if (f) {
       serializeJsonPretty(doc, f);
@@ -390,6 +420,56 @@ void loadConfig() {
     Serial.println(F("[CONFIG] Countdown object not found, defaulting to disabled."));
     countdownFinished = false;
   }
+
+  // --- HOME ASSISTANT CONFIG LOADING ---
+  if (doc.containsKey("homeAssistant")) {
+    JsonObject haObj = doc["homeAssistant"];
+    
+    haEnabled = haObj["enabled"] | false;
+    strlcpy(haIp, haObj["ip"] | "", sizeof(haIp));
+    haPort = haObj["port"] | 8123;
+    
+    // Load and trim token
+    String tokenStr = haObj["token"] | "";
+    tokenStr.trim();  // Remove leading/trailing whitespace
+    strlcpy(haToken, tokenStr.c_str(), sizeof(haToken));
+    
+    haDuration = haObj["duration"] | 5000;
+    
+    Serial.printf("[CONFIG] HA enabled=%d, IP=%s, Port=%d, Token length=%d\n", 
+                  haEnabled, haIp, haPort, strlen(haToken));
+    
+    // Load sensors array
+    haSensorCount = 0;
+    if (haObj.containsKey("sensors") && haObj["sensors"].is<JsonArray>()) {
+      JsonArray sensorsArray = haObj["sensors"].as<JsonArray>();
+      int i = 0;
+      for (JsonObject sensorObj : sensorsArray) {
+        if (i >= 5) break;  // Max 5 sensors (memory optimization)
+        
+        strlcpy(haSensors[i].entityId, sensorObj["entityId"] | "", sizeof(haSensors[i].entityId));
+        strlcpy(haSensors[i].label, sensorObj["label"] | "", sizeof(haSensors[i].label));
+        haSensors[i].isValid = false;
+        strcpy(haSensors[i].value, "");
+        strcpy(haSensors[i].unit, "");
+        
+        if (strlen(haSensors[i].entityId) > 0) {
+          haSensorCount++;
+          i++;
+        }
+      }
+      Serial.printf("[CONFIG] Loaded %d Home Assistant sensors\n", haSensorCount);
+    }
+  } else {
+    haEnabled = false;
+    strcpy(haIp, "");
+    haPort = 8123;
+    strcpy(haToken, "");
+    haDuration = 5000;
+    haSensorCount = 0;
+    Serial.println(F("[CONFIG] Home Assistant object not found, defaulting to disabled."));
+  }
+  
   Serial.println(F("[CONFIG] Configuration loaded."));
 }
 
@@ -453,7 +533,8 @@ void connectWiFi() {
   while (animating) {
     unsigned long now = millis();
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println(F("[WIFI] Connected: ") + WiFi.localIP().toString());
+      Serial.print(F("[WIFI] Connected: "));
+      Serial.println(WiFi.localIP());
       isAPMode = false;
 
       WiFiMode_t mode = WiFi.getMode();
@@ -717,6 +798,13 @@ void setupWebServer() {
     doc[F("password")] = getSafePassword();
     doc[F("openWeatherApiKey")] = getSafeApiKey();
     doc[F("mode")] = isAPMode ? "ap" : "sta";
+    
+    // Mask HA token
+    if (doc.containsKey("homeAssistant") && doc["homeAssistant"].containsKey("token")) {
+      if (strlen(haToken) > 0) {
+        doc["homeAssistant"]["token"] = "********************************";
+      }
+    }
 
     String response;
     serializeJson(doc, response);
@@ -824,6 +912,66 @@ void setupWebServer() {
     countdownObj["targetTimestamp"] = newTargetTimestamp;
     countdownObj["label"] = countdownLabelStr;
     countdownObj["isDramaticCountdown"] = newIsDramaticCountdown;
+
+    // --- Home Assistant Configuration Saving ---
+    bool newHaEnabled = (request->hasParam("haEnabled", true) && 
+                         (request->getParam("haEnabled", true)->value() == "true" || 
+                          request->getParam("haEnabled", true)->value() == "on" || 
+                          request->getParam("haEnabled", true)->value() == "1"));
+    String haIpStr = request->hasParam("haIp", true) ? request->getParam("haIp", true)->value() : "";
+    int haPortInt = request->hasParam("haPort", true) ? request->getParam("haPort", true)->value().toInt() : 8123;
+    String haTokenStr = request->hasParam("haToken", true) ? request->getParam("haToken", true)->value() : "";
+    unsigned long haDurationInt = request->hasParam("haDuration", true) ? request->getParam("haDuration", true)->value().toInt() : 5000;
+
+    // Trim strings to remove whitespace
+    haIpStr.trim();
+    haTokenStr.trim();
+
+    // Save existing token before creating new object
+    String existingToken = "";
+    if (doc.containsKey("homeAssistant") && doc["homeAssistant"].containsKey("token")) {
+      existingToken = doc["homeAssistant"]["token"].as<String>();
+    }
+
+    JsonObject haObj = doc.createNestedObject("homeAssistant");
+    haObj["enabled"] = newHaEnabled;
+    haObj["ip"] = haIpStr;
+    haObj["port"] = haPortInt;
+    
+    // Handle token masking like API key
+    if (haTokenStr != "********************************" && haTokenStr.length() > 0) {
+      haObj["token"] = haTokenStr;
+      Serial.printf("[SAVE] HA token updated (length: %d)\n", haTokenStr.length());
+    } else if (existingToken.length() > 0) {
+      // Keep existing token if masked
+      haObj["token"] = existingToken;
+      Serial.println(F("[SAVE] HA token unchanged (kept existing)."));
+    } else {
+      haObj["token"] = "";
+      Serial.println(F("[SAVE] HA token is empty."));
+    }
+    
+    haObj["duration"] = haDurationInt;
+
+    // Process sensors array (max 5 for memory optimization)
+    JsonArray sensorsArray = haObj.createNestedArray("sensors");
+    for (int i = 0; i < 5; i++) {
+      String entityIdParam = "haEntityId" + String(i);
+      String labelParam = "haLabel" + String(i);
+      
+      if (request->hasParam(entityIdParam.c_str(), true)) {
+        String entityId = request->getParam(entityIdParam.c_str(), true)->value();
+        String label = request->hasParam(labelParam.c_str(), true) ? 
+                       request->getParam(labelParam.c_str(), true)->value() : "";
+        
+        if (entityId.length() > 0) {
+          JsonObject sensorObj = sensorsArray.createNestedObject();
+          sensorObj["entityId"] = entityId;
+          sensorObj["label"] = label;
+        }
+      }
+    }
+    Serial.printf("[SAVE] Saved %d HA sensors\n", sensorsArray.size());
 
     FSInfo fs_info;
     LittleFS.info(fs_info);
@@ -1021,6 +1169,88 @@ void setupWebServer() {
     P.setZoneEffect(0, flipDisplay, PA_FLIP_LR);
     Serial.printf("[WEBSERVER] Set flipDisplay to %d\n", flipDisplay);
     request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/test_ha", HTTP_POST, [](AsyncWebServerRequest *request) {
+    Serial.println(F("[WEBSERVER] Request: /test_ha"));
+    
+    // Get parameters from request
+    String testIp = request->hasParam("ip", true) ? request->getParam("ip", true)->value() : "";
+    int testPort = request->hasParam("port", true) ? request->getParam("port", true)->value().toInt() : 8123;
+    String testToken = request->hasParam("token", true) ? request->getParam("token", true)->value() : "";
+    
+    if (testIp.length() == 0) {
+      request->send(400, "application/json", "{\"success\":false,\"message\":\"IP address is required\"}");
+      return;
+    }
+    
+    if (testToken.length() == 0) {
+      request->send(400, "application/json", "{\"success\":false,\"message\":\"Token is required\"}");
+      return;
+    }
+    
+    // If token is masked, use the existing one
+    if (testToken == "********************************" && strlen(haToken) > 0) {
+      testToken = String(haToken);
+    }
+    
+    // Trim token to remove any whitespace
+    testToken.trim();
+    
+    // Test connection to Home Assistant API
+    String url = "http://" + testIp + ":" + String(testPort) + "/api/";
+    
+    Serial.printf("[TEST_HA] Testing connection to: %s\n", url.c_str());
+    Serial.printf("[TEST_HA] Token length: %d\n", testToken.length());
+    Serial.printf("[TEST_HA] Token preview: %.20s...\n", testToken.c_str());
+    
+    // Print first 20 bytes in hex
+    Serial.print("[TEST_HA] Token hex (first 20 bytes): ");
+    for (int i = 0; i < 20 && i < testToken.length(); i++) {
+      Serial.printf("%02X ", (unsigned char)testToken[i]);
+    }
+    Serial.println();
+    
+    WiFiClient testClient;
+    HTTPClient http;
+    http.begin(testClient, url);
+    http.setTimeout(3000);  // Shorter timeout to prevent watchdog
+    
+    String authHeader = "Bearer " + testToken;
+    http.addHeader("Authorization", authHeader);
+    http.addHeader("Content-Type", "application/json");
+    
+    Serial.printf("[TEST_HA] Authorization header length: %d\n", authHeader.length());
+    
+    yield();  // Give ESP8266 time to process
+    ESP.wdtFeed();  // Feed the watchdog
+    
+    int httpCode = http.GET();
+    
+    yield();  // Give ESP8266 time to process
+    
+    DynamicJsonDocument responseDoc(128);  // Smaller buffer
+    
+    String response;
+    
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println(F("[TEST_HA] Connection successful!"));
+      response = "{\"success\":true,\"message\":\"Successfully connected to Home Assistant!\"}";
+    } else if (httpCode == 401) {
+      Serial.println(F("[TEST_HA] Authentication failed (401)"));
+      response = "{\"success\":false,\"message\":\"Authentication failed. Check your token.\"}";
+    } else if (httpCode == -1 || httpCode == -11) {
+      Serial.println(F("[TEST_HA] Connection failed (timeout or unreachable)"));
+      response = "{\"success\":false,\"message\":\"Connection timeout. Check IP and network.\"}";
+    } else {
+      Serial.printf("[TEST_HA] HTTP error: %d\n", httpCode);
+      response = "{\"success\":false,\"message\":\"HTTP error: " + String(httpCode) + "\"}";
+    }
+    
+    http.end();
+    yield();
+    
+    request->send(200, "application/json", response);
   });
 
   server.on("/set_twelvehour", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -1619,6 +1849,35 @@ void handleCaptivePortal(AsyncWebServerRequest *request) {
   }
 }
 
+// Sanitize text for LED display - only allow supported characters
+String sanitizeForDisplay(const String& input) {
+  if (input.length() == 0) return "";
+  
+  String result = "";
+  result.reserve(input.length());  // Pre-allocate to avoid fragmentation
+  
+  for (unsigned int i = 0; i < input.length() && i < 120; i++) {  // Max 120 chars
+    char c = input.charAt(i);
+    
+    // Convert lowercase to uppercase first
+    if (c >= 'a' && c <= 'z') {
+      c = c - 32;
+    }
+    
+    // Allow: A-Z, 0-9, space, : ! ' - . , _ + % / ?
+    if ((c >= 'A' && c <= 'Z') || 
+        (c >= '0' && c <= '9') || 
+        c == ' ' || c == ':' || c == '!' || c == '\'' || 
+        c == '-' || c == '.' || c == ',' || c == '_' || 
+        c == '+' || c == '%' || c == '/' || c == '?') {
+      result += c;
+    }
+    // Skip any other character
+  }
+  
+  return result;
+}
+
 String normalizeWeatherDescription(String str) {
   // Serbian Cyrillic → Latin
   str.replace("а", "a");
@@ -1817,11 +2076,6 @@ String buildWeatherURL() {
 
 
 void fetchWeather() {
-  if (millis() - lastWifiConnectTime < 5000) {
-    Serial.println(F("[WEATHER] Skipped: Network just reconnected. Letting it stabilize..."));
-    return;  // Stop execution if connection is less than 5 seconds old
-  }
-
   Serial.println(F("[WEATHER] Fetching weather data..."));
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("[WEATHER] Skipped: WiFi not connected"));
@@ -1843,51 +2097,62 @@ void fetchWeather() {
 
   Serial.println(F("[WEATHER] Connecting to OpenWeatherMap..."));
   String url = buildWeatherURL();
-  Serial.println(F("[WEATHER] URL: ") + url);
+  Serial.print(F("[WEATHER] URL: "));
+  Serial.println(url);
 
-  WiFiClientSecure client;  // use secure client for HTTPS
-  client.stop();            // ensure previous session closed
-  yield();                  // Allow OS to process socket closure
+  WiFiClientSecure client;
   client.setInsecure();     // no cert validation
-  HTTPClient http;          // Create an HTTPClient object
-  http.begin(client, url);  // Pass the WiFiClient object and the URL
   client.setBufferSizes(512, 512);
-  http.setTimeout(10000);  // Sets both connection and stream timeout to 10 seconds
-
+  
+  HTTPClient http;
+  http.begin(client, url);
+  http.setTimeout(10000);   // 10 second timeout
+  
   Serial.println(F("[WEATHER] Sending GET request..."));
-  int httpCode = http.GET();  // Send the GET request
+  yield();
+  
+  int httpCode = http.GET();
+  
+  Serial.print(F("[WEATHER] GET returned code: "));
+  Serial.println(httpCode);
+  
+  yield();
 
-  if (httpCode == HTTP_CODE_OK) {  // Check if HTTP response code is 200 (OK)
+  if (httpCode == HTTP_CODE_OK) {
     Serial.println(F("[WEATHER] HTTP 200 OK. Reading payload..."));
 
     String payload = http.getString();
     Serial.println(F("[WEATHER] Response received."));
-    Serial.println(F("[WEATHER] Payload: ") + payload);
 
-    DynamicJsonDocument doc(1536);  // Adjust size as needed, use ArduinoJson Assistant
+    DynamicJsonDocument doc(1536);
     DeserializationError error = deserializeJson(doc, payload);
 
     if (error) {
       Serial.print(F("[WEATHER] JSON parse error: "));
       Serial.println(error.f_str());
       weatherAvailable = false;
+      http.end();
       return;
     }
 
     if (doc.containsKey(F("main")) && doc[F("main")].containsKey(F("temp"))) {
       float temp = doc[F("main")][F("temp")];
       currentTemp = String((int)round(temp)) + "°";
-      Serial.printf("[WEATHER] Temp: %s\n", currentTemp.c_str());
+      Serial.print(F("[WEATHER] Temp: "));
+      Serial.println(currentTemp);
       weatherAvailable = true;
     } else {
       Serial.println(F("[WEATHER] Temperature not found in JSON payload"));
       weatherAvailable = false;
+      http.end();
       return;
     }
 
     if (doc.containsKey(F("main")) && doc[F("main")].containsKey(F("humidity"))) {
       currentHumidity = doc[F("main")][F("humidity")];
-      Serial.printf("[WEATHER] Humidity: %d%%\n", currentHumidity);
+      Serial.print(F("[WEATHER] Humidity: "));
+      Serial.print(currentHumidity);
+      Serial.println("%");
     } else {
       currentHumidity = -1;
     }
@@ -1905,7 +2170,8 @@ void fetchWeather() {
     }
 
     weatherDescription = normalizeWeatherDescription(detailedDesc);
-    Serial.printf("[WEATHER] Description used: %s\n", weatherDescription.c_str());
+    Serial.print(F("[WEATHER] Description used: "));
+    Serial.println(weatherDescription);
 
     // -----------------------------------------
     // Sunrise/Sunset for Auto Dimming (local time)
@@ -1939,8 +2205,14 @@ void fetchWeather() {
         sunsetHour = tmSunset.tm_hour;
         sunsetMinute = tmSunset.tm_min;
 
-        Serial.printf("[WEATHER] Adjusted Sunrise/Sunset (local): %02d:%02d | %02d:%02d\n",
-                      sunriseHour, sunriseMinute, sunsetHour, sunsetMinute);
+        Serial.print(F("[WEATHER] Adjusted Sunrise/Sunset (local): "));
+        Serial.print(sunriseHour);
+        Serial.print(":");
+        Serial.print(sunriseMinute);
+        Serial.print(" | ");
+        Serial.print(sunsetHour);
+        Serial.print(":");
+        Serial.println(sunsetMinute);
       } else {
         Serial.println(F("[WEATHER] Sunrise/Sunset not found in JSON."));
       }
@@ -1992,13 +2264,177 @@ void fetchWeather() {
     }
 
   } else {
-    Serial.printf("[WEATHER] HTTP GET failed, error code: %d, reason: %s\n",
-                  httpCode, http.errorToString(httpCode).c_str());
+    Serial.print(F("[WEATHER] HTTP GET failed, error code: "));
+    Serial.println(httpCode);
     weatherAvailable = false;
     weatherFetched = false;
   }
 
   http.end();
+  Serial.println(F("[WEATHER] Done."));
+}
+
+
+// -----------------------------------------------------------------------------
+// Home Assistant Data Fetching
+// -----------------------------------------------------------------------------
+void fetchHomeAssistantData() {
+  if (!haEnabled) {
+    Serial.println(F("[HA] Integration disabled, skipping fetch."));
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[HA] WiFi not connected, skipping fetch."));
+    haDataAvailable = false;
+    return;
+  }
+
+  if (strlen(haIp) == 0 || strlen(haToken) == 0) {
+    Serial.print(F("[HA] IP or Token not configured. IP len="));
+    Serial.print(strlen(haIp));
+    Serial.print(F(", Token len="));
+    Serial.println(strlen(haToken));
+    haDataAvailable = false;
+    return;
+  }
+  
+  // Debug: print token info (first and last 4 chars only for security)
+  if (strlen(haToken) > 8) {
+    char tokenPreview[20];
+    snprintf(tokenPreview, sizeof(tokenPreview), "%.4s...%.4s", haToken, haToken + strlen(haToken) - 4);
+    Serial.printf("[HA] Using token: %s (length: %d)\n", tokenPreview, strlen(haToken));
+    
+    // Print first 20 bytes in hex to detect hidden characters
+    Serial.print("[HA] Token hex (first 20 bytes): ");
+    for (int i = 0; i < 20 && i < strlen(haToken); i++) {
+      Serial.printf("%02X ", (unsigned char)haToken[i]);
+    }
+    Serial.println();
+  } else {
+    Serial.printf("[HA] Token too short: %d chars\n", strlen(haToken));
+  }
+
+  if (haSensorCount == 0) {
+    Serial.println(F("[HA] No sensors configured, skipping fetch."));
+    haDataAvailable = false;
+    return;
+  }
+
+  if (millis() - lastWifiConnectTime < 5000) {
+    Serial.println(F("[HA] Network just reconnected. Letting it stabilize..."));
+    return;
+  }
+
+  Serial.println(F("[HA] Fetching Home Assistant sensor data..."));
+  
+  bool anyValidSensor = false;
+  
+  for (int i = 0; i < haSensorCount; i++) {
+    yield();  // Feed watchdog before each sensor
+    
+    if (strlen(haSensors[i].entityId) == 0) continue;
+    
+    // Build URL: http://{ip}:{port}/api/states/{entity_id}
+    String url = "http://" + String(haIp) + ":" + String(haPort) + "/api/states/" + String(haSensors[i].entityId);
+    
+    Serial.printf("[HA] Fetching sensor %d: %s\n", i, haSensors[i].entityId);
+    Serial.printf("[HA] URL: %s\n", url.c_str());
+    
+    yield();  // Feed watchdog before HTTP request
+    
+    WiFiClient haClient;
+    HTTPClient http;
+    http.begin(haClient, url);
+    http.setTimeout(5000);  // 5 second timeout
+    
+    // Add headers exactly like curl
+    String authHeader = "Bearer " + String(haToken);
+    http.addHeader("Authorization", authHeader);
+    http.addHeader("Content-Type", "application/json");
+    
+    // Debug: print what we're sending
+    Serial.printf("[HA] Authorization header length: %d\n", authHeader.length());
+    Serial.printf("[HA] Full request: GET %s\n", url.c_str());
+    Serial.printf("[HA] Token preview: %.20s...\n", haToken);
+    
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.printf("[HA] Sensor %d response received\n", i);
+      
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, payload);
+      
+      if (error) {
+        Serial.printf("[HA] JSON parse error for sensor %d: %s\n", i, error.f_str());
+        haSensors[i].isValid = false;
+      } else {
+        // Extract state
+        if (doc.containsKey("state")) {
+          String state = doc["state"].as<String>();
+          strlcpy(haSensors[i].value, state.c_str(), sizeof(haSensors[i].value));
+          
+          // Extract unit of measurement
+          if (doc.containsKey("attributes") && doc["attributes"].containsKey("unit_of_measurement")) {
+            String unit = doc["attributes"]["unit_of_measurement"].as<String>();
+            strlcpy(haSensors[i].unit, unit.c_str(), sizeof(haSensors[i].unit));
+          } else {
+            strcpy(haSensors[i].unit, "");
+          }
+          
+          // If label is empty, try to use friendly_name
+          if (strlen(haSensors[i].label) == 0) {
+            if (doc.containsKey("attributes") && doc["attributes"].containsKey("friendly_name")) {
+              String friendlyName = doc["attributes"]["friendly_name"].as<String>();
+              friendlyName.toUpperCase();
+              // Truncate to fit
+              if (friendlyName.length() > 15) {
+                friendlyName = friendlyName.substring(0, 15);
+              }
+              strlcpy(haSensors[i].label, friendlyName.c_str(), sizeof(haSensors[i].label));
+            }
+          }
+          
+          haSensors[i].isValid = true;
+          anyValidSensor = true;
+          Serial.printf("[HA] Sensor %d: %s = %s%s\n", 
+                       i, haSensors[i].label, haSensors[i].value, haSensors[i].unit);
+        } else {
+          Serial.printf("[HA] No 'state' key in response for sensor %d\n", i);
+          haSensors[i].isValid = false;
+        }
+      }
+    } else if (httpCode == 401) {
+      String errorPayload = http.getString();
+      Serial.printf("[HA] Authentication failed for sensor %d (401 Unauthorized)\n", i);
+      Serial.printf("[HA] Response body: %s\n", errorPayload.c_str());
+      Serial.printf("[HA] Token being used (first 20 chars): %.20s\n", haToken);
+      Serial.printf("[HA] Token length: %d\n", strlen(haToken));
+      haSensors[i].isValid = false;
+    } else if (httpCode == 404) {
+      Serial.printf("[HA] Sensor %d not found (404) - check entity_id: %s\n", i, haSensors[i].entityId);
+      haSensors[i].isValid = false;
+    } else {
+      String errorPayload = http.getString();
+      Serial.printf("[HA] HTTP GET failed for sensor %d, code: %d\n", i, httpCode);
+      Serial.printf("[HA] Error response: %s\n", errorPayload.c_str());
+      haSensors[i].isValid = false;
+    }
+    
+    http.end();
+    yield();  // Give ESP time to process
+  }
+  
+  haDataAvailable = anyValidSensor;
+  lastHaFetchTime = millis();
+  
+  if (anyValidSensor) {
+    Serial.println(F("[HA] Data fetch completed successfully."));
+  } else {
+    Serial.println(F("[HA] No valid sensor data retrieved."));
+  }
 }
 
 
@@ -2297,23 +2733,30 @@ void advanceDisplayMode() {
     } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Clock, weather skipped)"));
+    } else if (haEnabled && haDataAvailable) {
+      displayMode = 4;  // Clock -> HA Sensors (if weather & countdown are skipped)
+      Serial.printf("[DISPLAY] Switching to HA SENSORS (weather check: avail=%d, key=%d, city=%d, country=%d)\n",
+                    weatherAvailable, strlen(openWeatherApiKey) == 32, strlen(openWeatherCity) > 0, strlen(openWeatherCountry) > 0);
     } else if (nightscoutConfigured) {
-      displayMode = 4;  // Clock -> Nightscout (if weather & countdown are skipped)
-      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Clock, weather & countdown skipped)"));
+      displayMode = 7;  // Clock -> Nightscout (if weather, countdown & HA are skipped)
+      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Clock, weather, countdown & HA skipped)"));
     } else {
       displayMode = 0;
       Serial.println(F("[DISPLAY] Staying in CLOCK (from Clock)"));
     }
-  } else if (displayMode == 5) {  // Date mode
+  } else if (displayMode == 5) {  // Date mode -> Weather OR Countdown OR HA OR Nightscout OR Clock
     if (weatherAvailable && (strlen(openWeatherApiKey) == 32) && (strlen(openWeatherCity) > 0) && (strlen(openWeatherCountry) > 0)) {
       displayMode = 1;
       Serial.println(F("[DISPLAY] Switching to display mode: WEATHER (from Date)"));
     } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Date, weather skipped)"));
-    } else if (nightscoutConfigured) {
+    } else if (haEnabled && haDataAvailable) {
       displayMode = 4;
-      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Date, weather & countdown skipped)"));
+      Serial.println(F("[DISPLAY] Switching to display mode: HA SENSORS (from Date, weather & countdown skipped)"));
+    } else if (nightscoutConfigured) {
+      displayMode = 7;
+      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Date, weather, countdown & HA skipped)"));
     } else {
       displayMode = 0;
       Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Date)"));
@@ -2325,9 +2768,12 @@ void advanceDisplayMode() {
     } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Weather)"));
+    } else if (haEnabled && haDataAvailable) {
+      displayMode = 4;  // Weather -> HA Sensors (if description & countdown are skipped)
+      Serial.println(F("[DISPLAY] Switching to display mode: HA SENSORS (from Weather, description & countdown skipped)"));
     } else if (nightscoutConfigured) {
-      displayMode = 4;  // Weather -> Nightscout (if description & countdown are skipped)
-      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Weather, description & countdown skipped)"));
+      displayMode = 7;  // Weather -> Nightscout (if description, countdown & HA are skipped)
+      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Weather, description, countdown & HA skipped)"));
     } else {
       displayMode = 0;
       Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Weather)"));
@@ -2336,22 +2782,36 @@ void advanceDisplayMode() {
     if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Description)"));
+    } else if (haEnabled && haDataAvailable) {
+      displayMode = 4;  // Description -> HA Sensors (if countdown is skipped)
+      Serial.println(F("[DISPLAY] Switching to display mode: HA SENSORS (from Description, countdown skipped)"));
     } else if (nightscoutConfigured) {
-      displayMode = 4;  // Description -> Nightscout (if countdown is skipped)
-      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Description, countdown skipped)"));
+      displayMode = 7;  // Description -> Nightscout (if countdown & HA are skipped)
+      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Description, countdown & HA skipped)"));
     } else {
       displayMode = 0;
       Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Description)"));
     }
-  } else if (displayMode == 3) {  // Countdown -> Nightscout
-    if (nightscoutConfigured) {
+  } else if (displayMode == 3) {  // Countdown -> HA Sensors OR Nightscout OR Clock
+    if (haEnabled && haDataAvailable) {
       displayMode = 4;
+      Serial.println(F("[DISPLAY] Switching to display mode: HA SENSORS (from Countdown)"));
+    } else if (nightscoutConfigured) {
+      displayMode = 7;
       Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Countdown)"));
     } else {
       displayMode = 0;
       Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Countdown)"));
     }
-  } else if (displayMode == 4) {  // Nightscout -> Custom Message
+  } else if (displayMode == 4) {  // HA Sensors -> Nightscout OR Custom Message OR Clock
+    if (nightscoutConfigured) {
+      displayMode = 7;
+      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from HA Sensors)"));
+    } else {
+      displayMode = 0;
+      Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from HA Sensors)"));
+    }
+  } else if (displayMode == 7) {  // Nightscout -> Custom Message
     displayMode = 6;
     Serial.println(F("[DISPLAY] Switching to display mode: CUSTOM MESSAGE (from Nightscout)"));
   } else if (displayMode == 6) {  // Custom Message -> Clock
@@ -2386,7 +2846,8 @@ void advanceDisplayModeSafe() {
     else if (displayMode == 1 && weatherAvailable && (strlen(openWeatherApiKey) == 32) && (strlen(openWeatherCity) > 0) && (strlen(openWeatherCountry) > 0)) valid = true;
     else if (displayMode == 2 && showWeatherDescription && weatherAvailable && weatherDescription.length() > 0) valid = true;
     else if (displayMode == 3 && countdownEnabled && !countdownFinished && ntpSyncSuccessful) valid = true;
-    else if (displayMode == 4 && nightscoutConfigured) valid = true;
+    else if (displayMode == 4 && haEnabled && haDataAvailable) valid = true;
+    else if (displayMode == 7 && nightscoutConfigured) valid = true;
     else if (displayMode == 6 && strlen(customMessage) > 0) valid = true;
 
     // If we've looped back to where we started, break to avoid infinite loop
@@ -2702,6 +3163,16 @@ void loop() {
     shouldFetchWeatherNow = false;
   }
 
+  // --- Home Assistant Data Fetching ---
+  // Only fetch if weather is not currently fetching to avoid conflicts
+  if (haEnabled && !isAPMode && WiFi.status() == WL_CONNECTED && weatherFetched) {
+    if (millis() - lastHaFetchTime >= haFetchInterval) {
+      Serial.println(F("[HA] Triggering Home Assistant data fetch..."));
+      fetchHomeAssistantData();
+      lastHaFetchTime = millis();
+      yield();  // Give ESP time after HA fetch
+    }
+  }
 
   const char *const *daysOfTheWeek = getDaysOfWeek(language);
   const char *daySymbol = daysOfTheWeek[timeinfo.tm_wday];
@@ -3243,8 +3714,109 @@ void loop() {
   }  // End of if (displayMode == 3 && ...)
 
 
+  // --- HOME ASSISTANT SENSORS Display Mode ---
+  if (displayMode == 4 && haEnabled && haDataAvailable) {
+    static unsigned long haSensorStartTime = 0;
+    static bool haSensorInitialized = false;
+    static unsigned long modeStartTime = 0;
+    
+    // Initialize mode start time
+    if (prevDisplayMode != displayMode) {
+      modeStartTime = millis();
+    }
+    
+    // Safety timeout: if stuck in HA mode for more than 30 seconds, force advance
+    if (millis() - modeStartTime > 30000) {
+      Serial.println(F("[HA DISPLAY] Safety timeout reached, forcing mode advance"));
+      currentHaSensorIndex = 0;
+      haSensorInitialized = false;
+      advanceDisplayModeSafe();
+      return;
+    }
+    
+    // Get current sensor
+    if (currentHaSensorIndex >= haSensorCount || currentHaSensorIndex < 0) {
+      currentHaSensorIndex = 0;
+    }
+    
+    HaSensor* currentSensor = &haSensors[currentHaSensorIndex];
+    
+    if (!currentSensor->isValid) {
+      // Skip invalid sensor, advance to next
+      Serial.printf("[HA DISPLAY] Skipping invalid sensor %d\n", currentHaSensorIndex);
+      currentHaSensorIndex++;
+      if (currentHaSensorIndex >= haSensorCount) {
+        currentHaSensorIndex = 0;
+        Serial.println(F("[HA DISPLAY] No valid sensors, advancing mode"));
+        advanceDisplayModeSafe();
+        haSensorInitialized = false;
+      }
+      return;  // Exit this cycle, try next sensor in next loop
+    }
+    
+    // Initialize display for this sensor only once
+    if (prevDisplayMode != displayMode || !haSensorInitialized) {
+      // Build display string: "LABEL: VALUE UNIT"
+      String displayText = "";
+      if (strlen(currentSensor->label) > 0) {
+        displayText = String(currentSensor->label);
+      } else {
+        displayText = String(currentSensor->entityId);
+      }
+      displayText += ": ";
+      displayText += String(currentSensor->value);
+      if (strlen(currentSensor->unit) > 0) {
+        displayText += String(currentSensor->unit);
+      }
+      
+      // Sanitize text for LED display - remove unsupported characters
+      displayText = sanitizeForDisplay(displayText);
+      
+      Serial.printf("[HA DISPLAY] Sanitized text: '%s' (len=%d)\n", displayText.c_str(), displayText.length());
+      
+      // Check if we need to scroll or display static
+      bool needsScroll = (displayText.length() > 8);
+      
+      haSensorStartTime = millis();
+      
+      if (needsScroll) {
+        P.displayText(displayText.c_str(), PA_CENTER, GENERAL_SCROLL_SPEED, 0, 
+                     getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay), 
+                     getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay));
+        Serial.printf("[HA DISPLAY] Scrolling sensor %d: %s\n", currentHaSensorIndex, displayText.c_str());
+      } else {
+        P.displayText(displayText.c_str(), PA_CENTER, 0, haDuration, PA_PRINT, PA_NO_EFFECT);
+        Serial.printf("[HA DISPLAY] Static sensor %d: %s\n", currentHaSensorIndex, displayText.c_str());
+      }
+      
+      prevDisplayMode = displayMode;
+      haSensorInitialized = true;
+    }
+    
+    // Check if animation is complete
+    if (P.displayAnimate()) {
+      // Animation cycle complete, move to next sensor
+      Serial.printf("[HA DISPLAY] Sensor %d display complete (count=%d/%d)\n", 
+                    currentHaSensorIndex, currentHaSensorIndex + 1, haSensorCount);
+      currentHaSensorIndex++;
+      haSensorInitialized = false;  // Need to initialize next sensor
+      
+      if (currentHaSensorIndex >= haSensorCount) {
+        currentHaSensorIndex = 0;
+        Serial.println(F("[HA DISPLAY] All sensors shown, advancing mode"));
+        prevDisplayMode = -1;
+        advanceDisplayModeSafe();
+      } else {
+        Serial.printf("[HA DISPLAY] Moving to sensor %d\n", currentHaSensorIndex);
+        prevDisplayMode = -1;  // Force re-initialization for next sensor
+      }
+    }
+    
+    yield();  // Give ESP8266 time to process other tasks
+  }  // End of if (displayMode == 4 && ...)
+
   // // --- NIGHTSCOUT Display Mode ---
-  if (displayMode == 4) {
+  if (displayMode == 7) {
     String ntpField = String(ntpServer2);
 
     // These static variables will retain their values between calls to this block
